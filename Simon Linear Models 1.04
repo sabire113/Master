@@ -1,0 +1,1238 @@
+# Importer nødvendige biblioteker
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from scipy.stats.mstats import winsorize
+import statsmodels.api as sm
+from sklearn.metrics import r2_score, mean_squared_error
+# from sklearn.linear_model import HuberRegressor # Alternativ til RLM
+from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV, ElasticNetCV
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline # Nyttig for PCR
+import datetime
+import warnings # For å håndtere warnings
+import traceback # For full traceback ved feil
+from collections import defaultdict # For å samle metrikker
+
+# Ignorer DeprecationWarning fra pandas groupby.apply og FutureWarning
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pandas")
+warnings.filterwarnings("ignore", category=FutureWarning) # For qcut/rank issues if any
+# Ignorer RuntimeWarning fra np.log hvis ønskelig (men vi prøver å fikse det)
+# warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in log")
+# Ignorer UserWarning fra sklearn om alpha valgt av CV
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+# Ignorer RuntimeWarning fra mean of empty slice (for np.nanmean)
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="Mean of empty slice")
+
+
+# ------------------------------------------------
+# Step 1: Load and Clean Dataset
+# ------------------------------------------------
+def load_prepare_data(file_path):
+    """
+    Laster inn data, rydder, beregner avkastning, markedsverdi,
+    og lager dummyvariabler for sektorer.
+    """
+    print(f"Laster data fra: {file_path}")
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"FEIL: Filen '{file_path}' ble ikke funnet.")
+        return None
+    print(f"Data lastet inn. Form: {df.shape}")
+
+    # --- Datofelt ---
+    if "Date" not in df.columns:
+        print("FEIL: 'Date'-kolonnen mangler i datafilen.")
+        return None
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values(by=["Instrument", "Date"]).reset_index(drop=True)
+    print("Dato konvertert og data sortert.")
+
+    # --- Avkastningsberegninger ---
+    if "ClosePrice" not in df.columns or "Instrument" not in df.columns:
+        print("FEIL: 'ClosePrice' eller 'Instrument' mangler for avkastningsberegning.")
+        return None
+    # Beregn månedlig avkastning (rå) for måned t
+    df["MonthlyReturn"] = df.groupby("Instrument")["ClosePrice"].pct_change()
+    # Fyll NaN som oppstår for første observasjon per instrument
+    df["MonthlyReturn"].fillna(0, inplace=True)
+    # Winsoriser for å håndtere ekstremverdier
+    df["MonthlyReturn"] = winsorize(df["MonthlyReturn"].values, limits=[0.01, 0.01])
+    print("Månedlig avkastning ('MonthlyReturn') beregnet og winsorisert for måned t.")
+
+    # Beregn justert avkastning for måned t (brukes som y_true for modelltrening)
+    if "NorgesBank10Y" not in df.columns:
+        print("ADVARSEL: 'NorgesBank10Y' mangler for å beregne risikojustert avkastning. Bruker 0 som risikofri rente.")
+        df["NorgesBank10Y"] = 0 # Sett til 0 hvis den mangler
+    # Deler årsrenten med 12 for å få månedsrente (for måned t)
+    df["MonthlyRiskFreeRate_t"] = df["NorgesBank10Y"] / 12 / 100 # Antar renten er i prosent
+    df["AdjustedReturn_t"] = df["MonthlyReturn"] - df["MonthlyRiskFreeRate_t"] # y_true
+    print("Risikojustert avkastning for måned t ('AdjustedReturn_t') beregnet (brukes som y_true).")
+
+    # Beregn neste måneds *rå* avkastning (for porteføljeevaluering)
+    # Skifter MonthlyReturn én periode tilbake innenfor hver instrumentgruppe
+    df['NextMonthlyReturn_t+1'] = df.groupby('Instrument')['MonthlyReturn'].shift(-1)
+    print("Neste måneds rå avkastning ('NextMonthlyReturn_t+1') beregnet (for evaluering).")
+
+    # --- Markedsverdi ---
+    if "ClosePrice" not in df.columns or "CommonSharesOutstanding" not in df.columns:
+        print("FEIL: 'ClosePrice' eller 'CommonSharesOutstanding' mangler for MarketCap-beregning.")
+        return None
+    df["MarketCap"] = df["ClosePrice"] * df["CommonSharesOutstanding"]
+    # Fyll NaN i MarketCap med 0, men filtrer bort disse senere i clean_data
+    df['MarketCap'] = df['MarketCap'].fillna(0)
+    print("Markedsverdi ('MarketCap') beregnet.")
+
+    # --- Sektor Dummies ---
+    if "EconomicSector" in df.columns:
+        df = pd.get_dummies(df, columns=["EconomicSector"], prefix="Sector", dtype=int)
+        print("Sektor dummy-variabler opprettet.")
+    else:
+        print("ADVARSEL: 'EconomicSector' kolonne ikke funnet, kan ikke lage sektor dummies.")
+
+    # --- Kolonnenavn ---
+    df.columns = df.columns.str.replace(" ", "_").str.replace("-", "_")
+    print("Kolonnenavn renset.")
+
+    # --- Log-transformasjon ---
+    print("Log-transformerer variabler...")
+    vars_to_log = ["MarketCap", "BM", "ClosePrice", "Volume", "CommonSharesOutstanding"]
+    for var in vars_to_log:
+        if var in df.columns:
+             # print(f"  Behandler {var}...") # Mindre verbose
+             # Sikrer at vi ikke tar log av 0 eller negativt
+             df[f"{var}_positive"] = df[var].where(df[var] > 1e-9, np.nan) # Bruk en liten terskel > 0
+             df[f"log_{var}"] = np.log(df[f"{var}_positive"])
+             log_median = df[f"log_{var}"].median()
+             # Fyll NaN som oppstod fra log(<=0) eller opprinnelig NaN med medianen
+             df[f"log_{var}"] = df[f"log_{var}"].fillna(log_median)
+             # Fyll også evt NaN som gjenstår i selve log_median (hvis hele kolonnen var <=0)
+             if pd.isna(log_median):
+                 df[f"log_{var}"] = df[f"log_{var}"].fillna(0) # Fallback til 0
+                 # print(f"    Advarsel: Median for log_{var} var NaN. Fylte med 0.") # Mindre verbose
+             # else:
+                 # print(f"    Median for log_{var}: {log_median:.4f}") # Mindre verbose
+
+             df.drop(columns=[f"{var}_positive"], inplace=True)
+        else:
+            print(f"  Advarsel: Kolonne '{var}' ikke funnet for log-transformasjon.")
+    print("Log-transformasjon fullført.")
+
+    # Endrer navn på target for klarhet
+    df.rename(columns={'AdjustedReturn_t': 'TargetReturn_t'}, inplace=True)
+    print("Omdøpt 'AdjustedReturn_t' til 'TargetReturn_t' for klarhet (dette er modellens y).")
+
+
+    return df
+
+# ------------------------------------------------
+# Step 2: Define Feature Sets
+# ------------------------------------------------
+def define_features(df):
+    """
+    Definerer ulike sett med features (prediktorvariabler).
+    Returnerer:
+        numeric_available_features: Alle numeriske features funnet.
+        ols3_features: De tre spesifikke features for OLS-3/OLS-3+H.
+    """
+    firm_features = [
+        "log_MarketCap", "log_BM", "log_ClosePrice", "log_Volume", "log_CommonSharesOutstanding",
+        "OpenPrice", "BidPrice", "AskPrice", "DividendYield", "BookValuePerShare", "Beta",
+        "Momentum_3M", "Momentum_6M", "Momentum_12M", "Volatility_3M", "Volatility_6M",
+        "Volatility_12M", "BidAskSpread", "TurnoverRatio"
+    ]
+    sector_dummies = [col for col in df.columns if col.startswith("Sector_")]
+    macro_features = [
+        "BrentOil", "USDNOK", "EURNOK", "US10Y", "USCPI", "USGDPGrowth",
+        "NorwegianCPI", "NIBOR3M", "NorgesBank10Y", "OSEBXReturns",
+         "MonthlyRiskFreeRate_t" # La til risikofri rente her
+    ]
+
+    # Kombiner og filtrer basert på eksisterende kolonner
+    all_defined_features = firm_features + sector_dummies + macro_features
+    available_features = [f for f in all_defined_features if f in df.columns]
+
+    # Identifiser numeriske blant de tilgjengelige
+    numeric_available_features = [f for f in available_features if pd.api.types.is_numeric_dtype(df[f])]
+    print(f"Totalt {len(numeric_available_features)} potensielle *numeriske* features/makrovariabler funnet i DataFrame.")
+
+    # Et mindre sett med features for OLS-3 modellen
+    ols3_features_def = ["log_BM", "Momentum_12M", "log_MarketCap"]
+    ols3_features = [f for f in ols3_features_def if f in df.columns]
+
+    missing_ols3 = [f for f in ols3_features_def if f not in ols3_features]
+    if missing_ols3:
+        print(f"ADVARSEL: Følgende definerte OLS3 features mangler i DataFrame: {missing_ols3}")
+    if not ols3_features:
+        print("FEIL: Ingen av de definerte OLS3 features finnes. Kan ikke fortsette med OLS-3/OLS-3+H.")
+        # Vi kan fortsatt potensielt kjøre de andre modellene, så vi returnerer det vi har
+    else:
+        print(f"Definerte OLS3 features som skal brukes (for OLS-3/OLS-3+H): {ols3_features}")
+
+    # Returnerer alle tilgjengelige numeriske features og det valgte OLS3-settet
+    return numeric_available_features, ols3_features
+
+# ------------------------------------------------
+# Step 3: Handle Missing / Infinite Values
+# ------------------------------------------------
+def clean_data(df, numeric_features_to_impute, essential_cols_for_dropna, target="TargetReturn_t"):
+    """
+    Håndterer uendelige verdier og fyller manglende verdier med medianen for numeriske features.
+    Fjerner rader der essensielle kolonner (inkludert ikke-numeriske) mangler.
+    Fjerner rader med MarketCap <= 0.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        numeric_features_to_impute (list): List of numeric column names to apply imputation on.
+               *** VIKTIG: Dette bør være ALLE numeriske features som potensielt skal brukes ***
+        essential_cols_for_dropna (list): List of all column names (numeric and non-numeric)
+                                          where missing values should lead to row removal.
+        target (str): Name of the target variable (used for messages).
+    """
+    print("Starter datarensing (missing/inf)...")
+    initial_rows = len(df)
+
+    # Sørg for at alle features som skal imputeres faktisk er numeriske
+    features_present = [f for f in numeric_features_to_impute if f in df.columns]
+    non_numeric_in_list = [f for f in features_present if not pd.api.types.is_numeric_dtype(df[f])]
+    if non_numeric_in_list:
+        print(f"  ADVARSEL: Følgende kolonner i 'numeric_features_to_impute' er ikke numeriske: {non_numeric_in_list}. De vil bli ignorert for imputering.")
+        features_present = [f for f in features_present if f not in non_numeric_in_list]
+
+    missing_features = [f for f in numeric_features_to_impute if f not in df.columns]
+    if missing_features:
+        print(f"  Advarsel: Følgende features listet for imputering mangler helt: {missing_features}")
+
+    if not features_present:
+         print("  Ingen gyldige numeriske features funnet for imputering.")
+    else:
+        # Erstatt inf med NaN FØR medianberegning
+        df[features_present] = df[features_present].replace([np.inf, -np.inf], np.nan)
+        print(f"  Uendelige verdier erstattet med NaN i {len(features_present)} numeriske feature-kolonner.")
+
+        # Beregn medianer (ignorerer NaN)
+        medians = df[features_present].median()
+        # Fyll NaN med medianene
+        df[features_present] = df[features_present].fillna(medians)
+
+        # Sjekk om noen medianer var NaN (skjer hvis hele kolonnen var NaN)
+        if medians.isnull().any():
+            print(f"  ADVARSEL: Medianberegning resulterte i NaN for kolonner: {medians[medians.isnull()].index.tolist()}. Disse NaN-verdiene forblir.")
+            # Vurder å fylle disse med 0 eller fjerne kolonnene hvis kritisk
+            cols_with_nan_median = medians[medians.isnull()].index.tolist()
+            df[cols_with_nan_median] = df[cols_with_nan_median].fillna(0) # Fyller med 0 som en fallback
+            print(f"    -> Fylte gjenværende NaN i disse kolonnene med 0.")
+
+        print("  Manglende verdier i numeriske features fylt med median (eller 0 som fallback).")
+
+
+    # Håndter dropna for essensielle kolonner
+    essential_cols_present = [col for col in essential_cols_for_dropna if col in df.columns]
+    missing_essential = [col for col in essential_cols_for_dropna if col not in df.columns]
+    if missing_essential:
+        print(f"  Advarsel: Følgende essensielle kolonner for dropna mangler helt: {missing_essential}")
+
+    rows_before_dropna = len(df)
+    # Sørger for at target er med i dropna sjekken hvis den finnes
+    if target not in essential_cols_present and target in df.columns:
+        essential_cols_present.append(target)
+
+    # Fjern rader med NaN i de *faktisk eksisterende* essensielle kolonnene
+    if essential_cols_present:
+        df = df.dropna(subset=essential_cols_present)
+        rows_after_dropna = len(df)
+        print(f"  Fjernet {rows_before_dropna - rows_after_dropna} rader pga. NaN i essensielle kolonner: {sorted(essential_cols_present)}")
+    else:
+        print("  Ingen essensielle kolonner funnet for dropna.")
+
+    # Filtrer MarketCap
+    if 'MarketCap' in df.columns:
+        rows_before_mc_filter = len(df)
+        df = df[df['MarketCap'] > 0]
+        rows_after_mc_filter = len(df)
+        print(f"  Fjernet {rows_before_mc_filter - rows_after_mc_filter} rader der MarketCap <= 0.")
+    else:
+        print("  Advarsel: 'MarketCap' kolonne ikke funnet, kan ikke filtrere på MarketCap <= 0.")
+
+    final_rows = len(df)
+    print(f"Datarensing fullført. Form: {df.shape}. Fjernet totalt {initial_rows - final_rows} rader.")
+
+    if df.empty:
+        print("FEIL: Ingen data igjen etter rensing.")
+
+    return df
+
+# ------------------------------------------------
+# Step 4: Rolling Window Splits
+# ------------------------------------------------
+def get_rolling_splits(df, train_period, val_period, test_period):
+    """
+    Lager rullerende vinduer basert på antall måneder.
+    Returnerer indekser og datoer for trenings-, validerings- og testsett.
+    """
+    if "Date" not in df.columns:
+        raise ValueError("'Date'-kolonnen mangler i DataFrame.")
+    df['MonthYear'] = df["Date"].dt.to_period('M') # Bruk denne for splitting
+    unique_dates = sorted(df["MonthYear"].unique())
+    n_unique_months = len(unique_dates)
+    total_window_months = train_period + val_period + test_period
+    print(f"Antall unike måneder i data: {n_unique_months}")
+    print(f"Total lengde på rullerende vindu: {total_window_months} måneder")
+    num_windows = n_unique_months - total_window_months + 1
+    if num_windows <= 0:
+        raise ValueError(f"Ikke nok data ({n_unique_months} måneder) for de angitte vinduslengdene (total {total_window_months} måneder).")
+    print(f"Genererer {num_windows} rullerende vinduer...")
+    for i in range(num_windows):
+        train_start_month = unique_dates[i]
+        train_end_month = unique_dates[i + train_period - 1]
+        val_start_month = unique_dates[i + train_period]
+        val_end_month = unique_dates[i + train_period + val_period - 1]
+        test_start_month = unique_dates[i + train_period + val_period]
+        test_end_month = unique_dates[i + total_window_months - 1]
+        # Bruk MonthYear for indeksering
+        train_idx = df[(df['MonthYear'] >= train_start_month) & (df['MonthYear'] <= train_end_month)].index
+        val_idx = df[(df['MonthYear'] >= val_start_month) & (df['MonthYear'] <= val_end_month)].index
+        test_idx = df[(df['MonthYear'] >= test_start_month) & (df['MonthYear'] <= test_end_month)].index
+        # Hent faktiske datoer for info
+        train_dates_actual = df.loc[train_idx, "Date"].unique()
+        val_dates_actual = df.loc[val_idx, "Date"].unique()
+        test_dates_actual = df.loc[test_idx, "Date"].unique()
+        yield train_idx, val_idx, test_idx, train_dates_actual, val_dates_actual, test_dates_actual
+    # Fjern MonthYear kolonnen etter bruk hvis ønskelig
+    # df.drop(columns=['MonthYear'], inplace=True) # Eller la den være
+
+# ------------------------------------------------
+# Step 5a: Run Statsmodels Model on a Single Rolling Window (MODIFISERT)
+# ------------------------------------------------
+def run_statsmodels_on_window(X_train_scaled, y_train, X_test_scaled, y_test, method='OLS-3'): # Endret default
+    """
+    Trener og evaluerer en Statsmodels-modell (OLS eller Huber) for ett enkelt rullerende vindu.
+    *** FORVENTER SKALERTE DATA SOM INPUT ***
+    Returnerer prediksjoner (OOS), OOS R2, OOS MSE, OOS Sharpe (pred.), In-Sample R2, In-Sample Sharpe (pred.) og modellen selv.
+    """
+    # Legg til konstantledd for Statsmodels
+    X_train_scaled_const = sm.add_constant(X_train_scaled, has_constant='add')
+    X_test_scaled_const = sm.add_constant(X_test_scaled, has_constant='add')
+    model = None
+    preds_oos = np.full(y_test.shape, np.nan) # OOS prediksjoner
+    preds_is = np.full(y_train.shape, np.nan) # IS prediksjoner
+    r2_oos, mse_oos, sharpe_oos = np.nan, np.nan, np.nan
+    r2_is, sharpe_is = np.nan, np.nan
+
+    try:
+        # Bruker de nye navnene her
+        if method.upper() == 'OLS-3':
+            model = sm.OLS(y_train, X_train_scaled_const).fit(cov_type='HAC', cov_kwds={'maxlags': 1})
+        elif method.upper() == 'OLS-3+H':
+            model = sm.RLM(y_train, X_train_scaled_const, M=sm.robust.norms.HuberT()).fit()
+        else:
+            raise ValueError(f"Ugyldig Statsmodels metode: {method}. Velg 'OLS-3' eller 'OLS-3+H'.")
+
+        # --- Out-of-Sample (OOS) Beregninger ---
+        preds_oos = model.predict(X_test_scaled_const)
+        nan_preds_oos = np.isnan(preds_oos)
+        if nan_preds_oos.any():
+            preds_oos[nan_preds_oos] = 0 # Erstatter med 0
+
+        y_test_valid = y_test[~nan_preds_oos]
+        preds_oos_valid = preds_oos[~nan_preds_oos]
+
+        if len(preds_oos_valid) > 1 and len(y_test_valid) == len(preds_oos_valid):
+            r2_oos = r2_score(y_test_valid, preds_oos_valid)
+            mse_oos = mean_squared_error(y_test_valid, preds_oos_valid)
+            pred_std_oos = np.std(preds_oos_valid)
+            sharpe_oos = np.mean(preds_oos_valid) / pred_std_oos if pred_std_oos != 0 else np.nan
+        else:
+            pass # Metrikker forblir NaN
+
+        # --- In-Sample (IS) Beregninger ---
+        preds_is = model.predict(X_train_scaled_const)
+        nan_preds_is = np.isnan(preds_is)
+        if nan_preds_is.any():
+            preds_is[nan_preds_is] = 0 # Erstatter med 0
+
+        y_train_valid = y_train[~nan_preds_is]
+        preds_is_valid = preds_is[~nan_preds_is]
+
+        if len(preds_is_valid) > 1 and len(y_train_valid) == len(preds_is_valid):
+            r2_is = r2_score(y_train_valid, preds_is_valid)
+            pred_std_is = np.std(preds_is_valid)
+            sharpe_is = np.mean(preds_is_valid) / pred_std_is if pred_std_is != 0 else np.nan
+        else:
+            pass # Metrikker forblir NaN
+
+    except Exception as e:
+        print(f"  FEIL under {method.upper()}-modell trening/prediksjon: {e}")
+        # traceback.print_exc() # For debugging
+        model = None # Sikrer at modellen er None ved feil
+
+    return preds_oos, r2_oos, mse_oos, sharpe_oos, r2_is, sharpe_is, model
+
+
+# ------------------------------------------------
+# Step 5b: Run Scikit-learn Model on a Single Rolling Window (MODIFISERT)
+# ------------------------------------------------
+def run_sklearn_on_window(X_train_scaled, y_train, X_test_scaled, y_test, model_type='OLS', n_components=10, alphas_ridge=np.logspace(-4, 4, 10), alphas_lasso=np.logspace(-6, -1, 10), l1_ratio_elastic=0.5): # Endret default
+    """
+    Trener og evaluerer en Scikit-learn modell for ett enkelt rullerende vindu.
+    Håndterer OLS, PLS, PCR, Ridge, LASSO, ElasticNet.
+    *** FORVENTER SKALERTE DATA SOM INPUT ***
+    Returnerer prediksjoner (OOS), OOS R2, OOS MSE, OOS Sharpe (pred.), In-Sample R2, In-Sample Sharpe (pred.) og modellen selv.
+    """
+    model = None
+    preds_oos = np.full(y_test.shape, np.nan) # OOS prediksjoner
+    preds_is = np.full(y_train.shape, np.nan) # IS prediksjoner
+    r2_oos, mse_oos, sharpe_oos = np.nan, np.nan, np.nan
+    r2_is, sharpe_is = np.nan, np.nan
+
+    try:
+        model_name = model_type.upper()
+
+        # Bruker det nye navnet for OLS med alle features
+        if model_name == 'OLS':
+            model = LinearRegression(fit_intercept=True)
+        elif model_name == 'PLS':
+            actual_n_components = min(n_components, X_train_scaled.shape[0], X_train_scaled.shape[1])
+            if actual_n_components < 1: actual_n_components = 1
+            model = PLSRegression(n_components=actual_n_components, scale=False)
+        elif model_name == 'PCR':
+            actual_n_components = min(n_components, X_train_scaled.shape[0], X_train_scaled.shape[1])
+            if actual_n_components < 1: actual_n_components = 1
+            model = Pipeline([
+                ('pca', PCA(n_components=actual_n_components)),
+                ('linear_regression', LinearRegression(fit_intercept=True))
+            ])
+        elif model_name == 'RIDGE':
+            model = RidgeCV(alphas=alphas_ridge, fit_intercept=True, scoring='neg_mean_squared_error')
+        elif model_name == 'LASSO':
+            model = LassoCV(alphas=alphas_lasso, fit_intercept=True, cv=5, max_iter=1000, tol=0.001, random_state=42, n_jobs=-1)
+        elif model_name == 'ELASTICNET':
+            model = ElasticNetCV(alphas=alphas_lasso, l1_ratio=[l1_ratio_elastic],
+                                 fit_intercept=True, cv=5, max_iter=1000, tol=0.001, random_state=42, n_jobs=-1)
+        else:
+            raise ValueError(f"Ugyldig Scikit-learn model type: {model_type}")
+
+        # Tren modellen
+        model.fit(X_train_scaled, y_train)
+
+        # --- Out-of-Sample (OOS) Beregninger ---
+        preds_oos = model.predict(X_test_scaled)
+        if preds_oos.ndim > 1 and preds_oos.shape[1] == 1: preds_oos = preds_oos.flatten()
+
+        nan_preds_oos = np.isnan(preds_oos)
+        if nan_preds_oos.any(): preds_oos[nan_preds_oos] = 0
+
+        y_test_valid = y_test[~nan_preds_oos]
+        preds_oos_valid = preds_oos[~nan_preds_oos]
+
+        if len(preds_oos_valid) > 1 and len(y_test_valid) == len(preds_oos_valid):
+            r2_oos = r2_score(y_test_valid, preds_oos_valid)
+            mse_oos = mean_squared_error(y_test_valid, preds_oos_valid)
+            pred_std_oos = np.std(preds_oos_valid)
+            sharpe_oos = np.mean(preds_oos_valid) / pred_std_oos if pred_std_oos != 0 else np.nan
+        else:
+            pass # Metrikker forblir NaN
+
+        # --- In-Sample (IS) Beregninger ---
+        preds_is = model.predict(X_train_scaled)
+        if preds_is.ndim > 1 and preds_is.shape[1] == 1: preds_is = preds_is.flatten()
+
+        nan_preds_is = np.isnan(preds_is)
+        if nan_preds_is.any(): preds_is[nan_preds_is] = 0
+
+        y_train_valid = y_train[~nan_preds_is]
+        preds_is_valid = preds_is[~nan_preds_is]
+
+        if len(preds_is_valid) > 1 and len(y_train_valid) == len(preds_is_valid):
+            r2_is = r2_score(y_train_valid, preds_is_valid)
+            pred_std_is = np.std(preds_is_valid)
+            sharpe_is = np.mean(preds_is_valid) / pred_std_is if pred_std_is != 0 else np.nan
+        else:
+            pass # Metrikker forblir NaN
+
+    except Exception as e:
+        print(f"  FEIL under {model_type.upper()}-modell trening/prediksjon: {e}")
+        # traceback.print_exc() # For debugging
+        model = None # Sikrer at modellen er None ved feil
+
+    return preds_oos, r2_oos, mse_oos, sharpe_oos, r2_is, sharpe_is, model
+
+
+# ------------------------------------------------
+# Step 6: Calculate Portfolio Performance (MODIFISERT)
+# ------------------------------------------------
+def calculate_portfolio_performance(results_df, original_df, prediction_cols, risk_free_rate_col='NorgesBank10Y', filter_small_caps=False):
+    """
+    Beregner ytelsen til desilporteføljer basert på modellprediksjoner.
+    GENERALISERT for å håndtere en liste med prediksjonskolonner.
+    Bruker neste måneds avkastning justert for neste måneds risikofri rente for ytelsesmåling.
+    Kan filtrere bort de 10% minste selskapene per måned.
+
+    Input:
+        results_df: DataFrame med Date, Instrument, TargetReturn_t og alle yhat_* kolonner.
+        original_df: Den opprinnelige DataFrame med nødvendige kolonner.
+        prediction_cols (list): Liste med navn på prediksjonskolonnene (f.eks., ['yhat_ols-3', 'yhat_ols-3+h', 'yhat_ols', ...]). # Endret eksempel
+        risk_free_rate_col: Navn på kolonnen med (årlig) risikofri rente i prosent
+        filter_small_caps (bool): Hvis True, fjern 10% minste selskaper basert på MarketCap hver måned.
+    Output:
+        Tuple: (Dictionary med ytelses-DataFrames (EW og VW) per modell,
+                Dictionary med H-L Sharpe ratioer per modell {'MODEL': {'hl_sharpe_ew': x, 'hl_sharpe_vw': y}})
+    """
+    print("\n--- Starter generalisert porteføljekonstruksjon og analyse ---")
+    if filter_small_caps:
+        print(">>> Filtrering av 10% minste selskaper per måned er AKTIVERT <<<")
+    else:
+        print(">>> Filtrering av 10% minste selskaper per måned er DEAKTIVERT <<<")
+
+    # Sjekk om nødvendige kolonner finnes
+    required_original_cols = ['Date', 'Instrument', 'MarketCap', 'NextMonthlyReturn_t+1', risk_free_rate_col, 'MonthlyRiskFreeRate_t']
+    if not all(col in original_df.columns for col in required_original_cols):
+        missing = [col for col in required_original_cols if col not in original_df.columns]
+        print(f"FEIL: Mangler nødvendige kolonner i original_df for porteføljeanalyse: {missing}")
+        return None, None # Returnerer None for begge
+    required_results_cols = ['Date', 'Instrument', 'TargetReturn_t'] + prediction_cols
+    if not all(col in results_df.columns for col in required_results_cols):
+        missing = [col for col in required_results_cols if col not in results_df.columns]
+        print(f"FEIL: Mangler nødvendige kolonner i results_df for porteføljeanalyse: {missing}")
+        return None, None # Returnerer None for begge
+
+    # Slå sammen resultater med nødvendige kolonner fra original df
+    portfolio_data = pd.merge(
+        results_df,
+        original_df[['Date', 'Instrument', 'MarketCap', 'NextMonthlyReturn_t+1', risk_free_rate_col, 'MonthlyRiskFreeRate_t']],
+        on=['Date', 'Instrument'],
+        how='inner'
+    )
+    print(f"Data for porteføljeanalyse etter merge: {portfolio_data.shape}")
+
+    # Konverter Date til Period[M] for gruppering per måned
+    portfolio_data['MonthYear'] = portfolio_data['Date'].dt.to_period('M')
+
+    # Beregn neste måneds risikofri rente
+    monthly_rf_avg = portfolio_data.groupby('MonthYear')['MonthlyRiskFreeRate_t'].mean()
+    next_month_rf_map = monthly_rf_avg.shift(-1)
+    portfolio_data['NextMonthRiskFreeRate_t+1'] = portfolio_data['MonthYear'].map(next_month_rf_map)
+    print("Estimert neste måneds risikofri rente ('NextMonthRiskFreeRate_t+1').")
+
+    # Fjerner rader med manglende verdier som er kritiske for evaluering
+    critical_cols = prediction_cols + ['TargetReturn_t', 'NextMonthlyReturn_t+1', 'MarketCap',
+                                     'MonthlyRiskFreeRate_t', 'NextMonthRiskFreeRate_t+1']
+    rows_before_crit_dropna = len(portfolio_data)
+    portfolio_data = portfolio_data.dropna(subset=critical_cols)
+    print(f"Størrelse etter dropna på kritiske kolonner: {portfolio_data.shape} (fjernet {rows_before_crit_dropna - len(portfolio_data)} rader)")
+
+    # Verdivekting krever positiv MC
+    rows_before_mc_filter = len(portfolio_data)
+    portfolio_data = portfolio_data[portfolio_data['MarketCap'] > 0]
+    print(f"Størrelse etter sikring av MarketCap > 0: {portfolio_data.shape} (fjernet {rows_before_mc_filter - len(portfolio_data)} rader)")
+
+    if portfolio_data.empty:
+        print("Ingen data igjen for porteføljekonstruksjon etter rensing/merge.")
+        return None, None # Returnerer None for begge
+
+    # Beregn neste måneds EXCESS return (dette er den realiserte ytelsen)
+    portfolio_data['NextMonthExcessReturn_t+1'] = portfolio_data['NextMonthlyReturn_t+1'] - portfolio_data['NextMonthRiskFreeRate_t+1']
+    print("Beregnet neste måneds EXCESS avkastning ('NextMonthExcessReturn_t+1') - brukes for ytelsesmåling.")
+
+    all_monthly_results = []
+    hl_monthly_dfs_plotting = {} # Lagrer H-L data for plotting per modell
+    hl_sharpe_ratios = defaultdict(lambda: {'hl_sharpe_ew': np.nan, 'hl_sharpe_vw': np.nan}) # For å lagre H-L Sharpe
+
+    # Gå gjennom hver måned i testperioden
+    unique_months = sorted(portfolio_data['MonthYear'].unique())
+    print(f"Itererer gjennom {len(unique_months)} måneder for porteføljer...")
+
+    for month in unique_months:
+        monthly_data_full = portfolio_data[portfolio_data['MonthYear'] == month].copy()
+
+        # Filtrer små selskaper hvis flagget er satt (én gang per måned)
+        if filter_small_caps:
+            if 'MarketCap' in monthly_data_full.columns and len(monthly_data_full) > 10:
+                market_cap_cutoff = monthly_data_full['MarketCap'].quantile(0.10)
+                monthly_data_filtered = monthly_data_full[monthly_data_full['MarketCap'] >= market_cap_cutoff].copy()
+            else:
+                monthly_data_filtered = monthly_data_full.copy() # Ingen filtrering hvis for få selskaper
+        else:
+            monthly_data_filtered = monthly_data_full.copy() # Ingen filtrering
+
+        if len(monthly_data_filtered) < 10:
+             # print(f"  Skipping {month}: Ikke nok data ({len(monthly_data_filtered)} instrumenter etter evt. filtering) for å lage 10 desiler.") # Mindre verbose
+             continue
+
+        # --- NY LOOP: Gå gjennom hver MODELLPREDIKSJONSKOLONNE ---
+        for model_pred_col in prediction_cols:
+            # Hent ut et meningsfylt navn for modellen
+            # Antar formatet 'yhat_MODELNAME' (hvor MODELNAME nå kan være 'ols-3', 'ols-3+h', 'ols' etc.)
+            # Vi bruker string manipulasjon for å få navnet
+            if model_pred_col.startswith('yhat_'):
+                model_name = model_pred_col[len('yhat_'):].upper()
+                # Spesialhåndtering for å beholde bindestrek og pluss
+                if model_name.lower() == 'ols-3': model_name = 'OLS-3'
+                elif model_name.lower() == 'ols-3+h': model_name = 'OLS-3+H'
+                # Andre navn blir bare gjort om til store bokstaver (f.eks. 'ols' blir 'OLS')
+            else:
+                model_name = model_pred_col.upper() # Fallback
+
+            # Bruk den filtrerte dataen for denne måneden
+            monthly_data = monthly_data_filtered.copy()
+
+            # Sorter og lag Desiler basert på DENNE modellens prediksjoner
+            monthly_data = monthly_data.sort_values(model_pred_col)
+            try:
+                # Bruk rank først for å håndtere ties bedre før qcut
+                monthly_data['Rank'] = monthly_data[model_pred_col].rank(method='first')
+                monthly_data['Decile'] = pd.qcut(monthly_data['Rank'], 10, labels=False, duplicates='drop')
+                if monthly_data['Decile'].nunique() < 10:
+                     # print(f"  ADVARSEL: Kunne ikke lage 10 distinkte desiler for {model_name} i {month} ({monthly_data['Decile'].nunique()} unike desiler). Hopper over denne modellen for måneden.") # Mindre verbose
+                     continue
+            except ValueError as e:
+                # print(f"  ADVARSEL: Kunne ikke lage 10 desiler for {model_name} i {month} ({len(monthly_data)} rader, {monthly_data[model_pred_col].nunique()} unike verdier): {e}. Hopper over denne modellen for måneden.") # Mindre verbose
+                continue
+
+            # Beregn Vekter
+            monthly_data['ew_weights'] = 1 / monthly_data.groupby('Decile')['Instrument'].transform('size')
+            market_cap_sum = monthly_data.groupby('Decile')['MarketCap'].transform('sum')
+            # Sikrer mot 0 i nevner og NaN/Inf resultat
+            monthly_data['vw_weights'] = np.where(market_cap_sum > 0, monthly_data['MarketCap'] / market_cap_sum, 0)
+
+            # Beregn vektet avkastning (realisert og predikert)
+            # *** KORREKSJON HER: Fjernet '_stock_' fra kolonnenavnene for excess return ***
+            monthly_data['ew_raw_ret_stock_t+1'] = monthly_data['NextMonthlyReturn_t+1'] * monthly_data['ew_weights']
+            monthly_data['vw_raw_ret_stock_t+1'] = monthly_data['NextMonthlyReturn_t+1'] * monthly_data['vw_weights']
+            monthly_data['ew_excess_ret_t_plus_1'] = monthly_data['NextMonthExcessReturn_t+1'] * monthly_data['ew_weights'] # Navn endret
+            monthly_data['vw_excess_ret_t_plus_1'] = monthly_data['NextMonthExcessReturn_t+1'] * monthly_data['vw_weights'] # Navn endret
+            # Predikert avkastning bruker den spesifikke modellens prediksjon
+            monthly_data['ew_pred_excess_ret_stock_t'] = monthly_data[model_pred_col] * monthly_data['ew_weights'] # Beholdt _stock_ her for predikert
+            monthly_data['vw_pred_excess_ret_stock_t'] = monthly_data[model_pred_col] * monthly_data['vw_weights'] # Beholdt _stock_ her for predikert
+
+            # Aggreger per desil
+            # *** KORREKSJON HER: Endret kildekolonnenavn i aggregeringen til å matche de nye navnene ***
+            monthly_portfolio_returns = monthly_data.groupby('Decile').agg(
+                ew_ret_t_plus_1=('ew_raw_ret_stock_t+1', 'sum'),
+                vw_ret_t_plus_1=('vw_raw_ret_stock_t+1', 'sum'),
+                ew_excess_ret_t_plus_1=('ew_excess_ret_t_plus_1', 'sum'), # Kilde endret
+                vw_excess_ret_t_plus_1=('vw_excess_ret_t_plus_1', 'sum'), # Kilde endret
+                ew_pred_excess_ret_t=('ew_pred_excess_ret_stock_t', 'sum'), # Bruker fortsatt _stock_ for predikert
+                vw_pred_excess_ret_t=('vw_pred_excess_ret_stock_t', 'sum')  # Bruker fortsatt _stock_ for predikert
+            ).reset_index()
+
+            monthly_portfolio_returns['MonthYear'] = month
+            monthly_portfolio_returns['Model'] = model_name # Bruk det utledede modellnavnet
+            all_monthly_results.append(monthly_portfolio_returns)
+        # --- Slutt på modell-loop ---
+    # --- Slutt på månedsloop ---
+
+    if not all_monthly_results:
+        print("Ingen månedlige porteføljeresultater ble generert for noen modeller.")
+        return None, None # Returnerer None for begge
+
+    combined_results_df = pd.concat(all_monthly_results).reset_index(drop=True)
+    print(f"\nSamlet {len(combined_results_df)} månedlige desilresultater på tvers av alle modeller.")
+
+    # --- Beregn Ytelsesmetrikker per modell ---
+    performance_summary_list = []
+    model_names_in_results = combined_results_df['Model'].unique()
+    print(f"Analyserer ytelse for modeller: {list(model_names_in_results)}")
+
+    for model_name in model_names_in_results:
+        model_results = combined_results_df[combined_results_df['Model'] == model_name].copy()
+        if model_results.empty:
+            # print(f"Ingen resultater for modell {model_name} å analysere.") # Mindre verbose
+            continue
+
+        # --- Beregn Desil Ytelse ---
+        # Denne aggregeringen bruker navnene som ble *output* fra forrige aggregering
+        # (f.eks. 'ew_excess_ret_t_plus_1'), så den skal være korrekt.
+        decile_performance = model_results.groupby('Decile').agg(
+            ew_pred_mean=('ew_pred_excess_ret_t', 'mean'),
+            vw_pred_mean=('vw_pred_excess_ret_t', 'mean'),
+            ew_excess_mean=('ew_excess_ret_t_plus_1', 'mean'), # OK
+            vw_excess_mean=('vw_excess_ret_t_plus_1', 'mean'), # OK
+            ew_ret_std=('ew_ret_t_plus_1', 'std'), # Bruker RÅ avkastning for std
+            vw_ret_std=('vw_ret_t_plus_1', 'std'), # Bruker RÅ avkastning for std
+            n_months=('MonthYear', 'count')
+        ).reset_index()
+
+        annualization_factor = 12
+        # Sharpe Ratio: Bruker gjennomsnittlig EXCESS avkastning / std av RÅ avkastning
+        decile_performance['ew_sharpe'] = np.where(
+            pd.notna(decile_performance['ew_ret_std']) & (decile_performance['ew_ret_std'] != 0),
+            (decile_performance['ew_excess_mean'] / decile_performance['ew_ret_std']) * np.sqrt(annualization_factor), np.nan
+        )
+        decile_performance['vw_sharpe'] = np.where(
+            pd.notna(decile_performance['vw_ret_std']) & (decile_performance['vw_ret_std'] != 0),
+            (decile_performance['vw_excess_mean'] / decile_performance['vw_ret_std']) * np.sqrt(annualization_factor), np.nan
+        )
+
+        # --- Beregn Long-Short (H-L) Ytelse ---
+        hl_monthly_df = pd.DataFrame()
+        hl_stats_df = pd.DataFrame() # Initialiser tom df
+        ew_sharpe_hl_val = np.nan # Initialiser H-L Sharpe
+        vw_sharpe_hl_val = np.nan # Initialiser H-L Sharpe
+
+        if 0 in model_results['Decile'].values and 9 in model_results['Decile'].values:
+            # Beregn månedlige H-L differanser
+            hl_monthly_calc = {}
+            # Denne listen bruker navnene som ble *output* fra første aggregering, så den skal være korrekt.
+            metrics_to_pivot = [
+                'ew_ret_t_plus_1', 'vw_ret_t_plus_1',
+                'ew_excess_ret_t_plus_1', 'vw_excess_ret_t_plus_1', # OK
+                'ew_pred_excess_ret_t', 'vw_pred_excess_ret_t'
+            ]
+
+            for metric in metrics_to_pivot:
+                pivoted = model_results.pivot(index='MonthYear', columns='Decile', values=metric)
+                col_name_hl = metric + '_HL'
+                if 0 in pivoted.columns and 9 in pivoted.columns:
+                    valid_rows = pivoted[9].notna() & pivoted[0].notna()
+                    hl_monthly_calc[col_name_hl] = pd.Series(np.nan, index=pivoted.index)
+                    hl_monthly_calc[col_name_hl][valid_rows] = pivoted.loc[valid_rows, 9] - pivoted.loc[valid_rows, 0]
+                else:
+                    hl_monthly_calc[col_name_hl] = pd.Series(np.nan, index=pivoted.index)
+
+            hl_monthly_df = pd.DataFrame(hl_monthly_calc)
+            hl_monthly_df.reset_index(inplace=True)
+
+            # Lagre for plotting (før dropna)
+            hl_monthly_dfs_plotting[model_name] = hl_monthly_df.copy()
+
+            # Fjern måneder hvor essensielle H-L beregninger er NaN (for Sharpe-beregning)
+            # Denne listen bruker de deriverte '_HL' navnene, så den skal være korrekt.
+            essential_hl_cols_for_sharpe = ['ew_excess_ret_t_plus_1_HL', 'ew_ret_t_plus_1_HL', # OK
+                                            'vw_excess_ret_t_plus_1_HL', 'vw_ret_t_plus_1_HL'] # OK
+            rows_before_hl_dropna = len(hl_monthly_df)
+            cols_exist_for_dropna = [col for col in essential_hl_cols_for_sharpe if col in hl_monthly_df.columns]
+
+            if cols_exist_for_dropna:
+                 hl_monthly_df_clean = hl_monthly_df.dropna(subset=cols_exist_for_dropna).copy()
+                 rows_after_hl_dropna = len(hl_monthly_df_clean)
+                 if rows_after_hl_dropna < rows_before_hl_dropna:
+                     pass # Mindre verbose
+            else:
+                 hl_monthly_df_clean = hl_monthly_df.copy()
+
+            # Fortsett kun hvis det er data igjen etter dropna
+            if not hl_monthly_df_clean.empty:
+                try:
+                    n_months_val = len(hl_monthly_df_clean)
+                    # Disse .get kallene bruker de deriverte '_HL' navnene, så de skal være korrekte.
+                    ew_pred_mean_val = hl_monthly_df_clean.get('ew_pred_excess_ret_t_HL', pd.Series(dtype=float)).mean()
+                    vw_pred_mean_val = hl_monthly_df_clean.get('vw_pred_excess_ret_t_HL', pd.Series(dtype=float)).mean()
+                    ew_excess_mean_val = hl_monthly_df_clean.get('ew_excess_ret_t_plus_1_HL', pd.Series(dtype=float)).mean() # OK
+                    vw_excess_mean_val = hl_monthly_df_clean.get('vw_excess_ret_t_plus_1_HL', pd.Series(dtype=float)).mean() # OK
+                    ew_std_val = hl_monthly_df_clean.get('ew_ret_t_plus_1_HL', pd.Series(dtype=float)).std()
+                    vw_std_val = hl_monthly_df_clean.get('vw_ret_t_plus_1_HL', pd.Series(dtype=float)).std()
+
+                    # Beregn Sharpe-verdier (og lagre dem)
+                    if pd.notna(ew_std_val) and ew_std_val != 0:
+                        ew_sharpe_hl_val = (ew_excess_mean_val / ew_std_val) * np.sqrt(annualization_factor)
+
+                    if pd.notna(vw_std_val) and vw_std_val != 0:
+                        vw_sharpe_hl_val = (vw_excess_mean_val / vw_std_val) * np.sqrt(annualization_factor)
+
+                    # Lag DataFrame direkte for tabellvisning
+                    hl_stats_data = {
+                        'ew_pred_mean': [ew_pred_mean_val], 'vw_pred_mean': [vw_pred_mean_val],
+                        'ew_excess_mean': [ew_excess_mean_val], 'vw_excess_mean': [vw_excess_mean_val],
+                        'ew_ret_std': [ew_std_val], 'vw_ret_std': [vw_std_val],
+                        'n_months': [n_months_val],
+                        'ew_sharpe': [ew_sharpe_hl_val], 'vw_sharpe': [vw_sharpe_hl_val],
+                        'Decile': ['H-L']
+                    }
+                    hl_stats_df = pd.DataFrame(hl_stats_data)
+
+                except Exception as e:
+                    print(f"  FEIL under H-L direkte kalkulering eller Sharpe-beregning for {model_name}: {e}")
+                    hl_stats_df = pd.DataFrame()
+                    ew_sharpe_hl_val, vw_sharpe_hl_val = np.nan, np.nan # Reset ved feil
+
+            else:
+                 hl_monthly_dfs_plotting.pop(model_name, None)
+                 ew_sharpe_hl_val, vw_sharpe_hl_val = np.nan, np.nan # Reset hvis ingen data
+
+        else:
+             hl_monthly_dfs_plotting.pop(model_name, None)
+             ew_sharpe_hl_val, vw_sharpe_hl_val = np.nan, np.nan # Reset hvis desiler mangler
+
+        # --- Lagre H-L Sharpe for denne modellen ---
+        hl_sharpe_ratios[model_name]['hl_sharpe_ew'] = ew_sharpe_hl_val
+        hl_sharpe_ratios[model_name]['hl_sharpe_vw'] = vw_sharpe_hl_val
+
+
+        # Kombiner desil-resultater og (muligens tom) H-L resultater for tabellvisning
+        if not hl_stats_df.empty:
+            all_cols = list(set(decile_performance.columns) | set(hl_stats_df.columns))
+            decile_performance_reindexed = decile_performance.reindex(columns=all_cols)
+            hl_stats_df_reindexed = hl_stats_df.reindex(columns=all_cols)
+            model_summary = pd.concat([decile_performance_reindexed, hl_stats_df_reindexed], ignore_index=True)
+        else:
+            model_summary = decile_performance
+
+        model_summary['Model'] = model_name # Legg til modellnavn
+        performance_summary_list.append(model_summary)
+    # --- Slutt på modell-analyse-loop ---
+
+
+    # --- Formater og presenter resultater ---
+    if not performance_summary_list:
+        print("Ingen ytelsesoppsummeringer kunne genereres for noen modeller.")
+        return None, None # Returnerer None for begge
+
+    final_summary_df = pd.concat(performance_summary_list).reset_index(drop=True)
+
+    # Funksjon for å formatere tabellene (lik som før, men brukes på flere modeller)
+    # Denne funksjonen bruker navnene fra 'decile_performance' og 'hl_stats_df'
+    # som er 'ew_excess_mean' etc., så den skal være korrekt.
+    def format_performance_table(df, model_name, weight_scheme):
+        model_data = df[df['Model'] == model_name].copy()
+        if model_data.empty: return pd.DataFrame()
+
+        if weight_scheme == 'EW':
+            cols_map = {'ew_pred_mean': 'Pred', 'ew_excess_mean': 'Real', 'ew_ret_std': 'Std', 'ew_sharpe': 'Sharpe'}
+        else: # VW
+            cols_map = {'vw_pred_mean': 'Pred', 'vw_excess_mean': 'Real', 'vw_ret_std': 'Std', 'vw_sharpe': 'Sharpe'}
+
+        relevant_cols_base = list(cols_map.keys())
+        relevant_cols = [col for col in relevant_cols_base if col in model_data.columns]
+
+        if 'Decile' not in model_data.columns: return pd.DataFrame()
+
+        sub_df = model_data[relevant_cols + ['Decile']].rename(columns=cols_map)
+        sub_df['Decile'] = sub_df['Decile'].astype(str)
+        sub_df = sub_df.set_index('Decile')
+
+        final_cols_display = ['Pred', 'Real', 'Std', 'Sharpe']
+        for col in final_cols_display:
+             if col in sub_df.columns:
+                 sub_df[col] = pd.to_numeric(sub_df[col], errors='coerce')
+
+        if 'Pred' in sub_df.columns: sub_df['Pred'] = (sub_df['Pred'] * 100).map('{:.2f}%'.format).replace('nan%', 'N/A')
+        if 'Real' in sub_df.columns: sub_df['Real'] = (sub_df['Real'] * 100).map('{:.2f}%'.format).replace('nan%', 'N/A')
+        if 'Std' in sub_df.columns: sub_df['Std'] = (sub_df['Std'] * 100).map('{:.2f}%'.format).replace('nan%', 'N/A')
+        if 'Sharpe' in sub_df.columns: sub_df['Sharpe'] = sub_df['Sharpe'].map('{:.2f}'.format).replace('nan', 'N/A')
+
+        def map_index(x):
+            if x == '0.0' or x == '0': return 'Low (L)'
+            if x == '9.0' or x == '9': return 'High (H)'
+            if x == 'H-L': return 'H-L'
+            try: return str(int(float(x)) + 1)
+            except ValueError: return x
+        sub_df.index = sub_df.index.map(map_index)
+
+        desired_order = ['Low (L)', '2', '3', '4', '5', '6', '7', '8', '9', 'High (H)', 'H-L']
+        sub_df = sub_df[sub_df.index.isin(desired_order)]
+        sub_df = sub_df.reindex(desired_order)
+
+        final_cols_present = [col for col in final_cols_display if col in sub_df.columns]
+        return sub_df[final_cols_present]
+
+
+    # Lag tabeller for hver modell og vekting
+    results_tables = {} # Lagre tabellene her
+    for model_name in model_names_in_results:
+        print(f"\n--- Ytelsestabell: {model_name} - Likevektet (EW) ---")
+        ew_table = format_performance_table(final_summary_df, model_name, 'EW')
+        if not ew_table.empty: print(ew_table); results_tables[f'{model_name}_EW'] = ew_table
+        else: print(f"Kunne ikke generere EW-tabell for {model_name}.")
+
+        print(f"\n--- Ytelsestabell: {model_name} - Verdivektet (VW) ---")
+        vw_table = format_performance_table(final_summary_df, model_name, 'VW')
+        if not vw_table.empty: print(vw_table); results_tables[f'{model_name}_VW'] = vw_table
+        else: print(f"Kunne ikke generere VW-tabell for {model_name}.")
+
+
+    # --- Plot kumulativ avkastning for Long-Short porteføljer ---
+    plt.figure(figsize=(14, 8))
+    plot_lines = 0
+    # Sorterer modellnavn for konsistent plot-rekkefølge
+    sorted_models_for_plot = sorted(hl_monthly_dfs_plotting.keys(), key=lambda x: (x != 'OLS-3', x != 'OLS-3+H', x != 'OLS', x)) # Sorterer OLS først
+
+    for model_name in sorted_models_for_plot:
+        model_hl_df = hl_monthly_dfs_plotting[model_name]
+        if 'MonthYear' in model_hl_df.columns:
+            # EW Plot
+            # Denne bruker de deriverte '_HL' navnene, så den skal være korrekt.
+            if 'ew_ret_t_plus_1_HL' in model_hl_df.columns:
+                plot_data_ew = model_hl_df.set_index('MonthYear')['ew_ret_t_plus_1_HL'].dropna()
+                if not plot_data_ew.empty:
+                    plot_data_ew.index = plot_data_ew.index.to_timestamp()
+                    (1 + plot_data_ew).cumprod().plot(label=f'{model_name} H-L EW')
+                    plot_lines += 1
+            # VW Plot
+            # Denne bruker de deriverte '_HL' navnene, så den skal være korrekt.
+            if 'vw_ret_t_plus_1_HL' in model_hl_df.columns:
+                plot_data_vw = model_hl_df.set_index('MonthYear')['vw_ret_t_plus_1_HL'].dropna()
+                if not plot_data_vw.empty:
+                    plot_data_vw.index = plot_data_vw.index.to_timestamp()
+                    (1 + plot_data_vw).cumprod().plot(label=f'{model_name} H-L VW', linestyle='--')
+                    plot_lines += 1
+
+    if plot_lines > 0:
+        plt.title('Kumulativ RÅ Avkastning for Long-Short Desilporteføljer (Høy - Lav, t+1)')
+        plt.ylabel('Kumulativ Avkastning (Log-skala)')
+        plt.xlabel('Måned')
+        plt.yscale('log')
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.tight_layout(rect=[0, 0, 0.85, 1])
+        plt.show()
+    else:
+        print("\nKunne ikke generere plott for kumulativ avkastning (ingen gyldig H-L råavkastningsdata funnet for noen modeller).")
+
+    # Returnerer de formaterte tabellene og H-L Sharpe ratioene
+    return results_tables, dict(hl_sharpe_ratios)
+
+
+# ------------------------------------------------
+# Step 7: Create and Print Summary Table (NY FUNKSJON)
+# ------------------------------------------------
+def create_and_print_summary_table(model_metrics, hl_sharpe_ratios):
+    """
+    Lager og printer en oppsummerende tabell med nøkkelmetrikker for hver modell.
+
+    Args:
+        model_metrics (dict): Dictionary som inneholder lister med metrikker per modell.
+                              Format: {'MODEL': {'oos_r2': [...], 'oos_sharpe': [...], 'is_r2': [...], 'is_sharpe': [...]}}
+        hl_sharpe_ratios (dict): Dictionary med H-L Sharpe ratioer per modell.
+                                 Format: {'MODEL': {'hl_sharpe_ew': x, 'hl_sharpe_vw': y}}
+    """
+    print("\n\n--- Oppsummerende Resultattabell ---")
+
+    summary_data = []
+    # Sorterer modellnavn for konsistent rekkefølge i tabellen
+    models_sorted = sorted(model_metrics.keys(), key=lambda x: (x != 'OLS-3', x != 'OLS-3+H', x != 'OLS', x)) # Sorterer OLS først
+
+    for model_name in models_sorted:
+        metrics = model_metrics[model_name]
+        hl_sharpes = hl_sharpe_ratios.get(model_name, {'hl_sharpe_ew': np.nan, 'hl_sharpe_vw': np.nan})
+
+        # Beregn gjennomsnitt, ignorer NaN
+        avg_oos_r2 = np.nanmean(metrics.get('oos_r2', []))
+        avg_is_r2 = np.nanmean(metrics.get('is_r2', []))
+        avg_oos_sharpe_pred = np.nanmean(metrics.get('oos_sharpe', [])) # Basert på prediksjoner
+        # avg_is_sharpe_pred = np.nanmean(metrics.get('is_sharpe', [])) # Basert på prediksjoner (valgfritt å inkludere)
+
+        summary_data.append({
+            'Modell': model_name,
+            'In-Sample R²': avg_is_r2,
+            'Out-of-Sample R²': avg_oos_r2,
+            'OOS Pred. Sharpe': avg_oos_sharpe_pred, # Sharpe basert på OOS prediksjoner
+            'H-L EW Sharpe': hl_sharpes.get('hl_sharpe_ew', np.nan),
+            'H-L VW Sharpe': hl_sharpes.get('hl_sharpe_vw', np.nan)
+        })
+
+    if not summary_data:
+        print("Ingen data tilgjengelig for å lage oppsummeringstabell.")
+        return
+
+    summary_df = pd.DataFrame(summary_data).set_index('Modell')
+
+    # Formatering
+    summary_df['In-Sample R²'] = summary_df['In-Sample R²'].map('{:.4f}'.format).replace('nan', 'N/A')
+    summary_df['Out-of-Sample R²'] = summary_df['Out-of-Sample R²'].map('{:.4f}'.format).replace('nan', 'N/A')
+    summary_df['OOS Pred. Sharpe'] = summary_df['OOS Pred. Sharpe'].map('{:.3f}'.format).replace('nan', 'N/A')
+    summary_df['H-L EW Sharpe'] = summary_df['H-L EW Sharpe'].map('{:.3f}'.format).replace('nan', 'N/A')
+    summary_df['H-L VW Sharpe'] = summary_df['H-L VW Sharpe'].map('{:.3f}'.format).replace('nan', 'N/A')
+
+    print(summary_df)
+
+
+# ------------------------------------------------
+# Step 8: Main Execution (MODIFISERT)
+# ------------------------------------------------
+def main(file_path="Cleaned_OSEFX_Market_Macro_Data.csv", filter_bottom_decile_marketcap=False):
+    """
+    Hovedfunksjon som kjører hele pipelinen:
+    1. Laster og forbereder data.
+    2. Definerer features (alle numeriske + OLS3-sett).
+    3. Renser data (imputerer ALLE numeriske features).
+    4. Utfører rullerende vindu-regresjon for ALLE modeller.
+    5. Samler prediksjoner og faktiske verdier.
+    6. Beregner og rapporterer OOS R2 for alle modeller (gjennomsnittlig).
+    7. Kjører generalisert detaljert porteføljeanalyse for alle modeller.
+    8. Printer en oppsummerende tabell med nøkkelmetrikker.
+    """
+    start_time = datetime.datetime.now()
+    print(f"Starter hovedprogram kl: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Steg 1: Last og klargjør data
+    print("--- Steg 1: Laster og forbereder data ---")
+    df = load_prepare_data(file_path)
+    if df is None: print("Avslutter på grunn av feil under datalasting."); return
+    print(f"Data lastet og forberedt. Form: {df.shape}")
+
+    # Steg 2: Definer features
+    print("\n--- Steg 2: Definerer features ---")
+    all_numeric_features, ols3_features = define_features(df)
+    if not all_numeric_features: print("FEIL: Ingen numeriske features funnet. Avslutter."); return
+    if not ols3_features: print("ADVARSEL: Kan ikke kjøre OLS-3/OLS-3+H da features mangler.")
+    print(f"  -> Bruker OLS3 features (hvis funnet): {ols3_features}")
+    print(f"  -> Bruker ALLE {len(all_numeric_features)} numeriske features for øvrige modeller.")
+
+    # Steg 3: Renser data
+    print("\n--- Steg 3: Renser data ---")
+    essential_cols_for_dropna = (ols3_features +
+                                 ['TargetReturn_t', 'NextMonthlyReturn_t+1', 'MarketCap',
+                                  'MonthlyRiskFreeRate_t', 'Date', 'Instrument'])
+    essential_cols_for_dropna = list(set([col for col in essential_cols_for_dropna if col in df.columns]))
+    df = clean_data(df, all_numeric_features, essential_cols_for_dropna, target="TargetReturn_t")
+    if df.empty: print("Avslutter fordi ingen data gjenstår etter rensing."); return
+    print(f"Data renset. Form etter fjerning av NaN/ugyldige: {df.shape}")
+
+    # Dobbeltsjekk features etter rensing
+    ols3_features = [f for f in ols3_features if f in df.columns]
+    all_numeric_features = [f for f in all_numeric_features if f in df.columns]
+    if not all_numeric_features: print("FEIL: Ingen numeriske features igjen etter rensing. Avslutter."); return
+    if not ols3_features: print("INFO: OLS-3 features ikke tilgjengelig etter rensing. Hopper over OLS-3 og OLS-3+H.") # Endret melding
+
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    # Steg 4 & 5: Rullerende vindu-analyse
+    train_period = 108; val_period = 72; test_period = 1
+    print(f"\n--- Steg 4 & 5: Rullerende vindu-analyse ---")
+    print(f"  Treningsperiode: {train_period} måneder"); print(f"  Valideringsperiode: {val_period} måneder"); print(f"  Testperiode: {test_period} måneder")
+
+    results_list = [] # Liste for å samle DataFrame per vindu
+    # NYTT: Dictionary for å samle metrikker per modell over alle vinduer
+    model_metrics = defaultdict(lambda: defaultdict(list))
+
+    # Definer modeller med de NYE navnene
+    models_to_run = {}
+    if ols3_features:
+        models_to_run['OLS-3'] = {'type': 'statsmodels', 'features': ols3_features}
+        models_to_run['OLS-3+H'] = {'type': 'statsmodels', 'features': ols3_features}
+    if all_numeric_features:
+         models_to_run['OLS'] = {'type': 'sklearn', 'features': all_numeric_features} # Endret fra OLS_SK
+         models_to_run['PLS'] = {'type': 'sklearn', 'features': all_numeric_features, 'params': {'n_components': 10}}
+         models_to_run['PCR'] = {'type': 'sklearn', 'features': all_numeric_features, 'params': {'n_components': 10}}
+         models_to_run['RIDGE'] = {'type': 'sklearn', 'features': all_numeric_features}
+         models_to_run['LASSO'] = {'type': 'sklearn', 'features': all_numeric_features}
+         models_to_run['ELASTICNET'] = {'type': 'sklearn', 'features': all_numeric_features}
+    else:
+        print("ADVARSEL: Ingen numeriske features tilgjengelig for Sklearn-modellene.")
+
+    print(f"Skal kjøre følgende modeller: {list(models_to_run.keys())}")
+
+    try:
+        splits_generator = get_rolling_splits(df, train_period, val_period, test_period)
+        splits = list(splits_generator)
+        num_windows = len(splits)
+    except ValueError as e:
+        print(f"Feil ved generering av splits: {e}\nAvslutter.")
+        return
+    print(f"Antall rullerende vinduer som skal kjøres: {num_windows}\n")
+    if num_windows == 0:
+        print("Ingen rullerende vinduer kunne genereres med gitte parametere. Avslutter.")
+        return
+
+    # --- Hovedløkke over hvert rullerende vindu ---
+    for window, (train_idx, val_idx, test_idx, train_dates, val_dates, test_dates) in enumerate(splits):
+        window_start_time = datetime.datetime.now()
+        if test_idx.empty: continue
+
+        test_start_date_obj = min(test_dates) if len(test_dates) > 0 else None
+        test_start_date = test_start_date_obj.strftime('%Y-%m') if test_start_date_obj else "N/A"
+        print(f"Behandler vindu {window + 1}/{num_windows} (Test måned: {test_start_date})")
+
+        train_val_idx = train_idx.union(val_idx)
+        y_train = df.loc[train_val_idx, "TargetReturn_t"]
+        y_test = df.loc[test_idx, "TargetReturn_t"]
+        test_instruments = df.loc[test_idx, 'Instrument']
+        test_actual_dates = df.loc[test_idx, 'Date']
+
+        window_predictions = {'Date': test_actual_dates.values,
+                              'Instrument': test_instruments.values,
+                              'TargetReturn_t': y_test.values}
+
+        # Skalering
+        scalers = {}
+        X_train_scaled_sets = {}
+        X_test_scaled_sets = {}
+
+        if ols3_features:
+            X_train_ols3 = df.loc[train_val_idx, ols3_features]
+            X_test_ols3 = df.loc[test_idx, ols3_features]
+            scaler_ols3 = StandardScaler()
+            try:
+                X_train_scaled_sets['ols3'] = scaler_ols3.fit_transform(X_train_ols3.values)
+                X_test_scaled_sets['ols3'] = scaler_ols3.transform(X_test_ols3.values)
+                X_train_scaled_sets['ols3'] = np.nan_to_num(X_train_scaled_sets['ols3'], nan=0.0)
+                X_test_scaled_sets['ols3'] = np.nan_to_num(X_test_scaled_sets['ols3'], nan=0.0)
+                scalers['ols3'] = scaler_ols3
+            except ValueError as e:
+                 print(f"  FEIL under skalering av OLS3 features: {e}. Hopper over OLS-3/OLS-3+H.")
+                 # Fjern OLS modeller hvis skalering feiler
+                 models_to_run = {k:v for k,v in models_to_run.items() if k not in ['OLS-3', 'OLS-3+H']}
+                 ols3_features = [] # Sørger for at de ikke kjøres
+
+        if all_numeric_features:
+            X_train_all = df.loc[train_val_idx, all_numeric_features]
+            X_test_all = df.loc[test_idx, all_numeric_features]
+            scaler_all = StandardScaler()
+            try:
+                X_train_scaled_sets['all'] = scaler_all.fit_transform(X_train_all.values)
+                X_test_scaled_sets['all'] = scaler_all.transform(X_test_all.values)
+                X_train_scaled_sets['all'] = np.nan_to_num(X_train_scaled_sets['all'], nan=0.0)
+                X_test_scaled_sets['all'] = np.nan_to_num(X_test_scaled_sets['all'], nan=0.0)
+                scalers['all'] = scaler_all
+            except ValueError as e:
+                 print(f"  FEIL under skalering av ALLE features: {e}. Hopper over Sklearn modeller.")
+                 # Fjern sklearn modeller hvis skalering feiler
+                 models_to_run = {k:v for k,v in models_to_run.items() if v['type'] != 'sklearn'}
+                 all_numeric_features = []
+
+        # Kjør modeller
+        for model_name, config in models_to_run.items():
+            print(f"  -> Kjører modell: {model_name}...")
+            # Bruker de nye navnene for å bestemme feature sett og yhat kolonnenavn
+            feature_set_name = 'ols3' if model_name in ['OLS-3', 'OLS-3+H'] else 'all'
+            yhat_col_name = f"yhat_{model_name.lower()}" # Lager f.eks. yhat_ols-3, yhat_ols-3+h, yhat_ols
+
+            if feature_set_name not in X_train_scaled_sets:
+                print(f"     Hopper over {model_name} (manglende skalert datasett '{feature_set_name}')")
+                window_predictions[yhat_col_name] = np.nan
+                continue
+
+            X_train_scaled = X_train_scaled_sets[feature_set_name]
+            X_test_scaled = X_test_scaled_sets[feature_set_name]
+
+            min_obs_needed = X_train_scaled.shape[1] + 1 if config['type'] == 'statsmodels' else X_train_scaled.shape[1]
+            if X_train_scaled.shape[0] < min_obs_needed:
+                print(f"     Hopper over {model_name} (for få observasjoner i treningssett: {X_train_scaled.shape[0]} < {min_obs_needed})")
+                window_predictions[yhat_col_name] = np.nan
+                continue
+            if X_train_scaled.shape[0] != y_train.shape[0]:
+                print(f"     FEIL! Mismatch i rader mellom X_train_scaled ({X_train_scaled.shape[0]}) og y_train ({y_train.shape[0]}) for {model_name}. Hopper over.")
+                window_predictions[yhat_col_name] = np.nan
+                continue
+
+            preds_oos = np.full(y_test.shape, np.nan)
+            r2_oos, mse_oos, sharpe_oos = np.nan, np.nan, np.nan
+            r2_is, sharpe_is = np.nan, np.nan
+            model_obj = None
+
+            if config['type'] == 'statsmodels':
+                preds_oos, r2_oos, mse_oos, sharpe_oos, r2_is, sharpe_is, model_obj = run_statsmodels_on_window(
+                    X_train_scaled, y_train, X_test_scaled, y_test, method=model_name # Sender det nye navnet
+                )
+            elif config['type'] == 'sklearn':
+                model_params = config.get('params', {})
+                preds_oos, r2_oos, mse_oos, sharpe_oos, r2_is, sharpe_is, model_obj = run_sklearn_on_window(
+                    X_train_scaled, y_train, X_test_scaled, y_test, model_type=model_name, **model_params # Sender det nye navnet
+                )
+
+            # Lagre prediksjoner for dette vinduet
+            window_predictions[yhat_col_name] = preds_oos
+
+            # NYTT: Lagre metrikker for dette vinduet (bruker det nye navnet som nøkkel)
+            model_metrics[model_name]['oos_r2'].append(r2_oos)
+            model_metrics[model_name]['oos_sharpe'].append(sharpe_oos) # Prediksjons-Sharpe OOS
+            model_metrics[model_name]['is_r2'].append(r2_is)
+            model_metrics[model_name]['is_sharpe'].append(sharpe_is) # Prediksjons-Sharpe IS
+
+        # Legg til resultatene fra dette vinduet i den totale listen
+        results_list.append(pd.DataFrame(window_predictions))
+        window_end_time = datetime.datetime.now()
+        print(f"  Vindu {window + 1} fullført på {(window_end_time - window_start_time).total_seconds():.1f} sek.")
+
+    # --- Etter løkken: Samle resultater og analyser ---
+    if not results_list:
+        print("\nIngen resultater ble generert fra de rullerende vinduene. Kan ikke fortsette.")
+        return
+
+    results_df = pd.concat(results_list).reset_index(drop=True)
+    print(f"\n--- Steg 6: Samlet resultatanalyse ---")
+    print(f"Total antall prediksjonsrader samlet: {len(results_df)}")
+
+    # Finner prediksjonskolonner basert på det nye navnemønsteret
+    prediction_cols_generated = [col for col in results_df.columns if col.startswith('yhat_')]
+    print(f"Prediksjonskolonner funnet: {prediction_cols_generated}")
+
+    initial_rows = len(results_df)
+    results_df.dropna(subset=['TargetReturn_t'] + prediction_cols_generated, how='all', inplace=True)
+    print(f"Antall rader etter fjerning av de med kun NaN: {len(results_df)} (fjernet {initial_rows - len(results_df)})")
+
+    if results_df.empty:
+         print("Ingen gyldige prediksjonsrader igjen for analyse.")
+         return
+
+    # Beregn Overall Out-of-Sample R² (som før, men nå er det også lagret i model_metrics)
+    print("\nBeregner Overall OOS R² (vs TargetReturn_t)...")
+    y_true_all = results_df['TargetReturn_t'].copy()
+    valid_y_idx = y_true_all.notna()
+    y_true_all = y_true_all[valid_y_idx]
+    results_df_r2_analysis = results_df[valid_y_idx].copy()
+
+    if y_true_all.empty:
+        print("  Ingen gyldige target-verdier (TargetReturn_t) for OOS R² beregning.")
+    elif y_true_all.var() < 1e-15:
+        print("  ADVARSEL: TargetReturn_t har (nær) null varians. Kan ikke beregne meningsfull OOS R².")
+    else:
+        ss_tot = np.sum((y_true_all - y_true_all.mean())**2)
+        if ss_tot == 0:
+            print("  ADVARSEL: Total sum of squares (SS_tot) er null. Kan ikke beregne OOS R².")
+        else:
+            for pred_col in prediction_cols_generated:
+                y_pred_model = results_df_r2_analysis[pred_col].copy()
+                valid_preds_idx = y_pred_model.notna()
+                y_true_matched = y_true_all[valid_preds_idx]
+                y_pred_matched = y_pred_model[valid_preds_idx]
+
+                if y_true_matched.empty or y_pred_matched.empty or len(y_true_matched) != len(y_pred_matched):
+                    print(f"  {pred_col}: Ingen gyldige matchende prediksjoner/targets for R2.")
+                    overall_r2 = np.nan
+                else:
+                     ss_res = np.sum((y_true_matched - y_pred_matched)**2)
+                     overall_r2 = 1 - (ss_res / ss_tot)
+                # Denne printen viser R2 beregnet på hele OOS perioden samlet
+                # Henter ut modellnavnet fra kolonnenavnet for penere print
+                model_name_print = pred_col[len('yhat_'):].upper()
+                if model_name_print.lower() == 'ols-3': model_name_print = 'OLS-3'
+                elif model_name_print.lower() == 'ols-3+h': model_name_print = 'OLS-3+H'
+                print(f"  Overall OOS R² {model_name_print}:   {overall_r2:.4f}")
+                # Gjennomsnittlig R2 over vinduene vil bli vist i oppsummeringstabellen
+
+
+    # --- Kjør generalisert porteføljeanalyse (Steg 7) ---
+    print("\n--- Steg 7: Porteføljeanalyse ---")
+    portfolio_results_tables = None
+    hl_sharpe_ratios = {} # Initialiser tom dict
+    if not results_df.empty and prediction_cols_generated:
+        portfolio_results_tables, hl_sharpe_ratios = calculate_portfolio_performance(
+            results_df,
+            df,
+            prediction_cols=prediction_cols_generated,
+            risk_free_rate_col='NorgesBank10Y',
+            filter_small_caps=filter_bottom_decile_marketcap
+            )
+        if portfolio_results_tables:
+            print("\nPorteføljeanalyse fullført.")
+        else:
+            print("\nPorteføljeanalyse kunne ikke fullføres.")
+            hl_sharpe_ratios = {} # Sørg for at den er tom hvis analyse feilet
+    else:
+        print("Ingen gyldige prediksjoner tilgjengelig for porteføljeanalyse.")
+
+    # --- NYTT: Lag og print oppsummeringstabell (Steg 8) ---
+    create_and_print_summary_table(model_metrics, hl_sharpe_ratios)
+
+
+    end_time = datetime.datetime.now()
+    print(f"\n--- Hovedprogram fullført kl: {end_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"Total kjøretid: {(end_time - start_time)}")
+
+
+# ------------------------------------------------
+# Kjør hovedfunksjonen
+# ------------------------------------------------
+if __name__ == "__main__":
+    # Sett filsti og flagg for filtrering
+    data_file = "Cleaned_OSEFX_Market_Macro_Data.csv"
+    FILTER_SMALL_CAPS = False # Sett til True for å aktivere filtrering, False for å deaktivere
+
+    # Kjør hovedprogrammet
+    main(file_path=data_file, filter_bottom_decile_marketcap=FILTER_SMALL_CAPS)
+
